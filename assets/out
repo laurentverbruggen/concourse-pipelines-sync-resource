@@ -1,0 +1,303 @@
+#!/bin/bash
+# vim: set ft=sh
+
+set -e
+
+exec 3>&1 # make stdout available as fd 3 for the result
+exec 1>&2 # redirect all output to stderr for logging
+
+source $(dirname $0)/utils.sh
+
+source=$1
+
+if [ -z "$source" ]; then
+  echo "usage: $0 <path/to/source>"
+  exit 1
+fi
+
+# for jq
+PATH=/usr/local/bin:$PATH
+
+payload=$TMPDIR/pipelines-sync-resource-request
+
+cat > $payload <&0
+
+log "Parsing payload"
+username=$(jq -r '.source.username // ""' < "$payload")
+password=$(jq -r '.source.password // ""' < "$payload")
+team=$(jq -r '.source.team // "main"' < "$payload")
+atc=$(jq -r ".source.target // \"$ATC_EXTERNAL_URL\"" < "$payload")
+insecure=$(jq -r '.source.insecure // "false"' < "$payload")
+
+if [ -z "$username" ]; then
+  log "Missing username"
+  exit 1
+fi
+
+if [ -z "$password" ]; then
+  log "Missing password"
+  exit 1
+fi
+
+cd "$source"
+
+log "Parsing parameters"
+config=$(jq -r '.params.config.file // ""' < "$payload")
+pipelines=$(jq -r '.params.config.pipelines // []' < "$payload")
+sync=$(jq -r '.params.sync // false' < "$payload")
+inject=$(jq -r '.params.inject // false' < "$payload")
+pipeline_group=$(jq -r '.params.pipeline_group // "original"' < "$payload")
+start=$(jq -r '.params.start // false' < "$payload")
+vars=$(jq -r '.params.vars // [] | .[]' < "$payload")
+vars_from=$(jq -r '.params.vars_from // [] | .[]' < "$payload")
+
+# reference included in pipeline names to allow tracking them for sync (when removing others)
+reference=$(jq -r ".params.reference // \" (${BUILD_PIPELINE_NAME} > ${BUILD_JOB_NAME})\"" < "$payload")
+reference=$(replace_placeholder "$reference" "BUILD_PIPELINE_NAME" "$BUILD_PIPELINE_NAME")
+reference=$(replace_placeholder "$reference" "BUILD_JOB_NAME" "$BUILD_JOB_NAME")
+
+if [ "$inject" == "true" ]; then
+  # no syncing for inject (since no other pipelines are created)
+  sync=false
+fi
+
+if [ "$sync" == "true" -a -z "$reference" ]; then
+  log "Syncing without reference is not allowed since it would remove all pipelines"
+  exit 1
+fi
+
+if [ -z "$config" -a "$pipelines" == "[]" ]; then
+  log "Missing config, either add a config file or add some pipelines"
+  exit 1
+fi
+
+if [ -n "$config" ]; then
+  if [ ! -r "$config" ]; then
+    log "Config file '$config' can't be found"
+    exit 1
+  fi
+
+  # determine base directory from config file, which is important for all references to pipeline yml files in config
+  base=$(dirname "$config")
+
+  # add config file contents to pipelines (and remap config and vars_from paths to include base path of config file)
+  log "Gathering pipelines from $config"
+  config_pipelines="$(jq -c '.pipelines // [] | .[]' "$config")"
+  if [ -n "$config_pipelines" ]; then
+    while read pipeline ; do
+      pipelines=$(jq -c ". + [($pipeline | .config = (\"${base}/\" + .config) | .vars_from = (.vars_from // [] | map(\"${base}/\" + .)))]" <<< "$pipelines")
+    done <<< "$config_pipelines"
+  fi
+fi
+
+get_fly_variables() {
+  # $1: array of strings
+  # $2: key for every array item
+  # $3: verify readability (in case of file)
+
+  local result=""
+  if [ -n "$1" ]; then
+    log "Collecting fly variables for $2"
+    while read var ; do
+      if [ "$3" == "true" -a ! -r "$var" ]; then
+        log "Variables file to load can't be found: $var"
+        exit 1
+      fi
+
+      result+=" $2 \"$(replace "$var" '"' '\\"')\" "
+    done <<< "$1"
+  fi
+  echo "$result"
+}
+
+fly_vars=$(get_fly_variables "$vars" "--var")
+fly_vars_from=$(get_fly_variables "$vars_from" "--load-vars-from" true)
+
+target="concourse-pipelines-sync-${BUILD_PIPELINE_NAME}-${BUILD_JOB_NAME}"
+
+insecure=""
+if [ "$insecure" == "true" ]; then
+  insecure=" --insecure "
+fi
+
+# first authenticate
+log "Authenticating for target $target"
+fly -t "$target" login -c "$atc" -u "$username" -p "$password" -n "$team" $insecure
+
+# make sure your fly version is in sync with concourse version
+log "Syncing fly version with target concourse"
+fly -t "$target" sync
+
+# track pipelines so we can remove unconfigured ones later
+INCLUDED_PIPELINES=()
+
+# create temporary files for pipeline handling
+tmp="$TMPDIR/pipelines-sync-resource-tmp-pipeline"
+pipeline_payload="$TMPDIR/pipelines-sync-resource-pipeline"
+
+# gather all files to validate for changes
+log "Searching pipeline files..."
+files="$(jq -c '.[]' <<< "$pipelines")"
+if [ -n "$files" ]; then
+  while read pipeline ; do
+    log "Reading pipeline config: $pipeline"
+    pipeline_name=$(echo "$pipeline" | jq -r '.name')
+    pipeline_config=$(echo "$pipeline" | jq -r '.config')
+    pipeline_vars=$(echo "$pipeline" | jq -r '.vars // [] | .[]')
+    pipeline_vars_from=$(echo "$pipeline" | jq -r '.vars_from // [] | .[]')
+
+    # if pipeline file does not exist or isn't readable we exit with failure
+    if [ ! -r "${pipeline_config}" ]; then
+      log "Missing config file '$pipeline_config' for '$pipeline_name'"
+      exit 2
+    fi
+
+    # add fly variables from pipeline config and add them to general variables (collected from resource parameters)
+    fly_variables="${fly_vars}$(get_fly_variables "$pipeline_vars" "--var")"
+    fly_variables_from="${fly_vars_from}$(get_fly_variables "$pipeline_vars_from" "--load-vars-from" true)"
+
+    if [ "$inject" == "true" ]; then
+
+      # check if pipeline_name doesn't match reserved group name
+      if [ "$pipeline_group" == "$pipeline_name" ]; then
+        log "Group '$pipeline_group' is a reserved group name and can't be used as group to inject new pipeline configuration"
+        exit 1
+      fi
+
+      # get current pipeline configuration
+      log "Getting pipeline configuration for $BUILD_PIPELINE_NAME"
+      fly -t "$target" get-pipeline -p "$BUILD_PIPELINE_NAME" --json | jq -c '.' > "$pipeline_payload"
+
+      # check if there are already groups defined
+      if [ $(jq -r '.groups | length' < "$pipeline_payload") -gt 0 ]; then
+
+        # verify if group already exists
+        if jq -r '.groups[].name' < "$pipeline_payload" | grep -e "$pipeline_name" >/dev/null; then
+          log "Group '$pipeline_name' already exists for '$BUILD_PIPELINE_NAME', cleaning up all dependencies"
+
+          # only keep other groups (if any)
+          groups_to_keep=$(jq -c ".groups | map(select(.name != \"$pipeline_name\"))" < "$pipeline_payload")
+
+          # collect all jobs/resources referenced in group (except those referenced in others)
+          log "Collecting jobs to update/remove"
+          jobs_to_remove=$(unique_sibling_elements "$pipeline_payload" "groups" "$pipeline_name" "jobs")
+          log "Collecting resources to update/remove"
+          resources_to_remove=$(unique_sibling_elements "$pipeline_payload" "groups" "$pipeline_name" "resources")
+
+          # only keep resource types that are referenced in resources
+          log "Collecting resource types to update/remove"
+          jobs_to_keep=$(jq -c ".jobs | map(select(.name | in($(array_as_object_with_values_as_keys <<< "$jobs_to_remove")) | not))" < "$pipeline_payload")
+          resources_to_keep=$(jq -c ".resources | map(select(.name | in($(array_as_object_with_values_as_keys <<< "$resources_to_remove")) | not))" < "$pipeline_payload")
+          resource_types_to_keep=$(jq -c ".resource_types | map(select(.name | in($(array_as_object_with_values_as_keys ".type" <<< "$resources_to_keep"))))" < "$pipeline_payload")
+
+          log "Storing clean (original) pipeline in temporary file: $pipeline_payload"
+          jq -n "{
+            groups: $groups_to_keep,
+            resource_types: $resource_types_to_keep,
+            resources: $resources_to_keep,
+            jobs: $jobs_to_keep
+          }" > "$pipeline_payload"
+        fi
+
+      else
+
+        # no groups defined yet, so create a new 'original' group holding current jobs/resources
+        log "No groups defined yet, creating group '$pipeline_group' referencing all jobs and resources"
+        jq ". + { groups: [
+          {
+            name: \"$pipeline_group\",
+            jobs: $(jq -c ".jobs // [] | reduce .[] as \$item ([]; . + [ (\$item.name) ])" < "$pipeline_payload"),
+            resources: $(jq -c ".resources // [] | reduce .[] as \$item ([]; . + [ (\$item.name) ])" < "$pipeline_payload")
+          }
+        ] }" < "$pipeline_payload" > "$tmp" && cat "$tmp" > "$pipeline_payload"
+
+      fi
+
+      # get pipeline configuration by adding and removing pipeline to concourse
+      # TODO should be adapted by verify call, feature request added to GitHub: https://github.com/concourse/concourse/issues/747
+      temporary_pipeline="pipelines-sync-$RANDOM"
+      log "Setting pipeline '${temporary_pipeline}' with config '${pipeline_config}' and '${fly_variables_from}${fly_variables}' for target '${target}'"
+      fly -t "$target" set-pipeline -p "$temporary_pipeline" -c "${pipeline_config}" $fly_variables_from $fly_variables -n >/dev/null
+      log "Getting pipeline configuration for $temporary_pipeline"
+      fly -t "$target" get-pipeline -p "$temporary_pipeline" --json | jq -c '.' > "$pipeline_config"
+      log "Removing pipeline '$temporary_pipeline'"
+      fly -t "$target" destroy-pipeline -p "$temporary_pipeline" -n >/dev/null
+
+      log "Injecting group '$pipeline_name'"
+      jq ".groups = .groups + [
+          {
+            name: \"$pipeline_name\",
+            jobs: $(jq -c ".jobs // [] | reduce .[] as \$item ([]; . + [ (\$item.name) ])" < "$pipeline_config"),
+            resources: $(jq -c ".resources // [] | reduce .[] as \$item ([]; . + [ (\$item.name) ])" < "$pipeline_config")
+          }
+        ]" < "$pipeline_payload" > "$tmp" && cat "$tmp" > "$pipeline_payload"
+
+      inject() {
+        local element=$1
+        local verify=${2:-true}
+
+        log "Injecting $element for '$pipeline_name'"
+        if [ "$verify" == "true" ]; then
+          local existing=$(jq -c ".$element // [] | reduce .[] as \$item ({}; . + { (\$item.name): \$item })" < "$pipeline_payload")
+          local duplicate=$(jq -r ".$element // [] | map(select(.name | in($existing))) | map(.name) | join(\", \")" < "$pipeline_config")
+          if [ -n "$duplicate" ]; then
+            log "Duplicate $element '$duplicate' detected, please rename $element"
+            exit 1
+          fi
+        fi
+
+        jq ".$element = .$element + $(jq -c ".$element // []" < "$pipeline_config")" < "$pipeline_payload" > "$tmp" && cat "$tmp" > "$pipeline_payload"
+      }
+
+      inject "jobs"
+      inject "resources"
+      inject "resource_types"
+      # Note: no groups are injected because it would be impossible to distinguish the injected from the original ones without renaming them
+
+      # update current pipeline with new configuration from included $pipeline_config file
+      log "Setting pipeline '${BUILD_PIPELINE_NAME}' with config '${pipeline_payload}' for target '${target}'"
+      fly -t "$target" set-pipeline -p "$BUILD_PIPELINE_NAME" -c "${pipeline_payload}" -n
+
+    else
+
+      # grep current pipelines to know if it is a new or existing pipeline
+      pipeline_name+="$reference"
+      log "Checking if '$pipeline_name' already exists"
+      if fly -t "$target" pipelines | grep "$pipeline_name"; then
+        existing="true"
+      fi
+
+      # update/create pipelines that are included in pipelines_file
+      log "Setting pipeline '${pipeline_name}' with config '${pipeline_config}' and '${fly_variables_from}${fly_variables}' for target '${target}'"
+      fly -t "$target" set-pipeline -p "$pipeline_name" -c "${pipeline_config}" $fly_variables_from $fly_variables -n
+
+      # immediately start pipelines if requested
+      if [ "$start" == "true" -a "$existing" != "true" ]; then
+        log "New pipeline '$pipeline_name' => unpausing"
+        fly -t "$target" unpause-pipeline -p "$pipeline_name"
+      fi
+
+      # track included pipelines
+      INCLUDED_PIPELINES+=("$pipeline_name")
+    fi
+  done <<< "$files"
+fi
+
+# remove pipelines that are no longer included in config files (except this pipeline)
+if [ "$sync" == "true" ]; then
+  log "Sync is active, removing all unecessary pipelines..."
+  fly -t "$target" pipelines | grep "$reference" | while read pipeline_status_line; do
+    pipeline=$(echo "$pipeline_status_line" | sed -E "s/^(.*)(yes|no) +(yes|no)$/\1/" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -e "${reference}$")
+    if [ -n "$pipeline" ]; then
+      if ! contains_element "$pipeline" "${INCLUDED_PIPELINES[@]}"; then
+        # remove pipelines not included in config files
+        log "Removing pipeline '$pipeline'"
+        fly -t "$target" destroy-pipeline -p "$pipeline" -n
+      fi
+    fi
+  done
+fi
+
+jq -n "{
+  version: {}
+}" >&3
