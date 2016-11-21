@@ -40,9 +40,9 @@ resources:
 * `team`: *Optional (default: main).* Name of team. Equivalent of `-n team-name` in `fly` login command.
 
 * `atc`: *Optional (default: $ATC_EXTERNAL_URL).*  URL of your concourse instance e.g. `https://my-concourse.com`.
-If not specified, the resource defaults to the ATC_EXTERNAL_URL` environment variable, meaning it will always target the same concourse that created the container.
+If not specified, the resource defaults to the `ATC_EXTERNAL_URL` environment variable, meaning it will always target the same concourse that created the container.
 
-* `insecure`: *Optional (default: false.* Connect to Concourse insecurely - i.e. skip SSL validation. Defaults to false if not provided.
+* `insecure`: *Optional (default: false).* Connect to Concourse insecurely - i.e. skip SSL validation. Defaults to false if not provided.
 
 
 ## Behavior
