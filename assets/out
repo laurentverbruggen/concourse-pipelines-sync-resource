@@ -48,8 +48,6 @@ sync=$(jq -r '.params.sync // false' < "$payload")
 inject=$(jq -r '.params.inject // false' < "$payload")
 pipeline_group=$(jq -r '.params.pipeline_group // "original"' < "$payload")
 start=$(jq -r '.params.start // false' < "$payload")
-vars=$(jq -r '.params.vars // [] | .[]' < "$payload")
-vars_from=$(jq -r '.params.vars_from // [] | .[]' < "$payload")
 
 # reference included in pipeline names to allow tracking them for sync (when removing others)
 reference=$(jq -r ".params.reference // \" (${BUILD_PIPELINE_NAME} > ${BUILD_JOB_NAME})\"" < "$payload")
@@ -91,27 +89,41 @@ if [ -n "$config" ]; then
 fi
 
 get_fly_variables() {
-  # $1: array of strings
-  # $2: key for every array item
-  # $3: verify readability (in case of file)
+  # $1: payload
 
+  local pipeline_vars=$(echo "$1" | jq -r '.vars // {} | keys | .[]')
   local result=""
-  if [ -n "$1" ]; then
-    log "Collecting fly variables for $2"
-    while read var ; do
-      if [ "$3" == "true" -a ! -r "$var" ]; then
-        log "Variables file to load can't be found: $var"
-        exit 1
-      fi
-
-      result+=" $2 \"$(replace "$var" '"' '\\"')\" "
-    done <<< "$1"
+  if [ -n "$pipeline_vars" ]; then
+    while read key ; do
+      log "Including fly variable for $key"
+      local value=$(echo "$1" | jq -r ".vars.$key")
+      result+=" --var \"$(replace "$key" '"' '\"')=$(replace "$value" '"' '\"')\" "
+    done <<< "$pipeline_vars"
   fi
   echo "$result"
 }
 
-fly_vars=$(get_fly_variables "$vars" "--var")
-fly_vars_from=$(get_fly_variables "$vars_from" "--load-vars-from" true)
+get_fly_variables_from() {
+  # $1: payload
+
+  local pipeline_vars_from=$(echo "$1" | jq -r '.vars_from // [] | .[]')
+  local result=""
+  if [ -n "$pipeline_vars_from" ]; then
+    while read var ; do
+      if [ ! -r "$var" ]; then
+        log "Variables file to load can't be found: $var"
+        exit 1
+      fi
+
+      log "Including fly variables from $var"
+      result+=" --load-vars-from \"$var\" "
+    done <<< "$pipeline_vars_from"
+  fi
+  echo "$result"
+}
+
+fly_vars=$(get_fly_variables "$(jq -c '.params' < "$payload")")
+fly_vars_from=$(get_fly_variables_from "$(jq -c '.params' < "$payload")")
 
 target="concourse-pipelines-sync-${BUILD_PIPELINE_NAME}-${BUILD_JOB_NAME}"
 
@@ -140,11 +152,9 @@ log "Searching pipeline files..."
 files="$(jq -c '.[]' <<< "$pipelines")"
 if [ -n "$files" ]; then
   while read pipeline ; do
-    log "Reading pipeline config: $pipeline"
     pipeline_name=$(echo "$pipeline" | jq -r '.name')
     pipeline_config=$(echo "$pipeline" | jq -r '.config')
-    pipeline_vars=$(echo "$pipeline" | jq -r '.vars // [] | .[]')
-    pipeline_vars_from=$(echo "$pipeline" | jq -r '.vars_from // [] | .[]')
+    log "Found pipeline '$pipeline_name' with config '$pipeline_config'"
 
     # if pipeline file does not exist or isn't readable we exit with failure
     if [ ! -r "${pipeline_config}" ]; then
@@ -153,8 +163,8 @@ if [ -n "$files" ]; then
     fi
 
     # add fly variables from pipeline config and add them to general variables (collected from resource parameters)
-    fly_variables="${fly_vars}$(get_fly_variables "$pipeline_vars" "--var")"
-    fly_variables_from="${fly_vars_from}$(get_fly_variables "$pipeline_vars_from" "--load-vars-from" true)"
+    fly_variables="${fly_vars}$(get_fly_variables "$pipeline")"
+    fly_variables_from="${fly_vars_from}$(get_fly_variables_from "$pipeline")"
 
     if [ "$inject" == "true" ]; then
 
@@ -216,7 +226,7 @@ if [ -n "$files" ]; then
       # get pipeline configuration by adding and removing pipeline to concourse
       # TODO should be adapted by verify call, feature request added to GitHub: https://github.com/concourse/concourse/issues/747
       temporary_pipeline="pipelines-sync-$RANDOM"
-      log "Setting pipeline '${temporary_pipeline}' with config '${pipeline_config}' and '${fly_variables_from}${fly_variables}' for target '${target}'"
+      log "Setting pipeline '${temporary_pipeline}' with config '${pipeline_config}' and variables for target '${target}'"
       fly -t "$target" set-pipeline -p "$temporary_pipeline" -c "${pipeline_config}" $fly_variables_from $fly_variables -n >/dev/null
       log "Getting pipeline configuration for $temporary_pipeline"
       fly -t "$target" get-pipeline -p "$temporary_pipeline" --json | jq -c '.' > "$pipeline_config"
@@ -268,7 +278,7 @@ if [ -n "$files" ]; then
       fi
 
       # update/create pipelines that are included in pipelines_file
-      log "Setting pipeline '${pipeline_name}' with config '${pipeline_config}' and '${fly_variables_from}${fly_variables}' for target '${target}'"
+      log "Setting pipeline '${pipeline_name}' with config '${pipeline_config}' and variables for target '${target}'"
       fly -t "$target" set-pipeline -p "$pipeline_name" -c "${pipeline_config}" $fly_variables_from $fly_variables -n
 
       # immediately start pipelines if requested

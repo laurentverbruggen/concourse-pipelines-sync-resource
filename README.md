@@ -63,6 +63,8 @@ Add pipeline configuration to concourse source. Pipelines can be passed either d
       pipelines:
       - name: discovery
         config: discover/pipeline.json
+    vars_from:
+    - discover/credentials.yml
 ```
 
 #### Dynamic
@@ -75,6 +77,8 @@ Add pipeline configuration to concourse source. Pipelines can be passed either d
     start: true
     config:
       file: discover/discovery.json
+    vars:
+      message: hello
 ```
 
 #### Parameters
@@ -90,7 +94,7 @@ Add pipeline configuration to concourse source. Pipelines can be passed either d
 
       * `config`: *Required.* Relative path (from source config file) to configuration file for pipeline
 
-      * `vars`: *Optional.* Variables that can be passed to pipeline creation, see [fly documentation](https://concourse.ci/fly-set-pipeline.html) for more information.
+      * `vars`: *Optional.* Variables (key-value) that can be passed to pipeline creation, see [fly documentation](https://concourse.ci/fly-set-pipeline.html) for more information.
       These variables take precedence over the variables defined in source (top level).
 
       * `vars_from`: *Optional.* Variable files that can be passed to pipeline creation, see [fly documentation](https://concourse.ci/fly-set-pipeline.html) for more information.
@@ -110,6 +114,6 @@ Groups that are defined in pipeline configuration files will be ignored since it
 
 * `start`: *Optional (default: false).* In concourse newly created pipelines are paused by default. This option allows you to automatically start them.
 
-* `vars`: *Optional.* List of variables to add to all pipelines on creation, see [fly documentation](https://concourse.ci/fly-set-pipeline.html) for more information.
+* `vars`: *Optional.* Variables (key-value) to add to all pipelines on creation, see [fly documentation](https://concourse.ci/fly-set-pipeline.html) for more information.
 
 * `vars_from`: *Optional.* List of variable files to add to all pipelines on creation, see [fly documentation](https://concourse.ci/fly-set-pipeline.html) for more information.
