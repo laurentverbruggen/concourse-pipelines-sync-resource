@@ -96,7 +96,7 @@ get_fly_variables() {
   if [ -n "$pipeline_vars" ]; then
     while read key ; do
       log "Including fly variable for $key"
-      local value=$(echo "$1" | jq -r ".vars.$key")
+      local value=$(echo "$1" | jq -r ".vars[\"$key\"]")
       result+=" --var \"$(replace "$key" '"' '\"')=$(replace "$value" '"' '\"')\" "
     done <<< "$pipeline_vars"
   fi
