@@ -61,9 +61,9 @@ contains_element() {
 }
 
 replace () {
-  local source="${1//\//\\\/}"
-  local search="${2//\//\\\/}"
-  local replace="${3//\//\\\/}"
+  local source="$1"
+  local search="$2"
+  local replace="$3"
 
   echo "${source//$search/$replace}"
 }
